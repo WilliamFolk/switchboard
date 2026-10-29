@@ -85,4 +85,4 @@ Your `switchboard.local.json` and shortcut are untouched by updates.
 | No projects listed | Press `N` on the projects screen, or clone a repository into the projects folder. |
 | No *Open a new agent* in a project | The folder is not a git repository or has no commits yet. Run `git init` there and make a first commit (or ask Claude to). |
 | VS Code does not open | `code .` has to work inside Ubuntu, which needs the WSL extension in VS Code. |
-| An account shows *not signed in* | Select it to sign in. |
+| An account shows *not signed in*, or *sign-in expired* in orange | Select it to sign in. An expired account keeps its settings and history; its plan, tier and usage stay frozen until you do. |

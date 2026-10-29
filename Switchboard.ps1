@@ -585,6 +585,7 @@ function Get-ClaudeProfiles {
             FetchedAtMs = $(if ($parts[7] -match '^\d+$') { [double]$parts[7] } else { 0 })
             SignedIn    = ($parts.Count -ge 9 -and $parts[8] -eq "1")
             SeatTier    = $(if ($parts.Count -ge 10) { $parts[9] } else { "" })
+            Expired     = ($parts.Count -ge 11 -and $parts[10] -eq "1")
             IsDefault   = ($parts[0] -eq "Default")
         }
     }
@@ -713,12 +714,31 @@ json_field() {
     printf '%s' "${value//|/ }"
 }
 
+# Prints 1 when a sign-in is dead: the access token has expired and so has the
+# refresh token that would renew it. Claude then fails every request quietly
+# while the credentials file - all "signed in" checks for - is still there,
+# and the account's plan, tier and usage stop updating. Anything unreadable
+# counts as not expired, so a missing jq never flags a working account.
+sign_in_expired() {
+    local creds="$1"
+    local now access refresh
+    now="$(date +%s%3N)"
+    access="$(json_field "$creds" '.claudeAiOauth.expiresAt')"
+    refresh="$(json_field "$creds" '.claudeAiOauth.refreshTokenExpiresAt')"
+    if [[ "$access" =~ ^[0-9]+$ && "$refresh" =~ ^[0-9]+$ ]] \
+        && [ "$access" -lt "$now" ] && [ "$refresh" -lt "$now" ]; then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
 account_row() {
     local name="$1"
     local dir="$2"
     local config="$dir/.claude.json"
     local creds="$dir/.credentials.json"
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$name" \
         "$dir" \
         "$(json_field "$config" '.oauthAccount.emailAddress')" \
@@ -728,7 +748,8 @@ account_row() {
         "$(json_field "$config" '.cachedUsageUtilization.utilization.seven_day.utilization')" \
         "$(json_field "$config" '.cachedUsageUtilization.fetchedAtMs')" \
         "$(if [ -s "$creds" ]; then echo 1; else echo 0; fi)" \
-        "$(json_field "$config" '.oauthAccount.seatTier')"
+        "$(json_field "$config" '.oauthAccount.seatTier')" \
+        "$(sign_in_expired "$creds")"
 }
 
 cmd="${1:-}"
@@ -1257,6 +1278,33 @@ function New-ClaudeProfile {
     }
 }
 
+function Write-ColoredText {
+    param(
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [string]$Color = ""
+    )
+
+    # The console palette has no orange, so "Orange" is drawn with a
+    # 256-colour VT code - the same VT support Clear-HostSafe relies on.
+    # Redirected output gets the nearest palette colour instead of raw codes.
+    if ($Color -eq "Orange") {
+        if ([Console]::IsOutputRedirected) {
+            Write-Host $Text -NoNewline -ForegroundColor DarkYellow
+        }
+        else {
+            Write-Host ("{0}[38;5;208m{1}{0}[0m" -f [char]27, $Text) -NoNewline
+        }
+        return
+    }
+
+    if (-not $Color) {
+        $Color = "DarkGray"
+    }
+    Write-Host $Text -NoNewline -ForegroundColor $Color
+}
+
 function Show-PagedMenu {
     param(
         [Parameter(Mandatory = $true)]
@@ -1312,12 +1360,7 @@ function Show-PagedMenu {
             if ($item.PSObject.Properties['Segments'] -and $item.Segments) {
                 Write-Host "      " -NoNewline
                 foreach ($segment in $item.Segments) {
-                    if ($segment.Color) {
-                        Write-Host $segment.Text -NoNewline -ForegroundColor $segment.Color
-                    }
-                    else {
-                        Write-Host $segment.Text -NoNewline -ForegroundColor DarkGray
-                    }
+                    Write-ColoredText -Text $segment.Text -Color $segment.Color
                 }
                 Write-Host ""
             }
@@ -1380,16 +1423,23 @@ function Show-Help {
     Write-Host "     Merge / delete agents    Claude merges finished work back, or discard it"
     Write-Host "     Open the project itself  plain VS Code, no branch"
     Write-Host ""
+    # Switchboard reads these straight from each account's own Claude files
+    # (oauthAccount.seatTier, claudeAiOauth.subscriptionType, the cached usage
+    # block); Claude Code is what refreshes them, as described here.
+    Write-Host "Plan, tier and usage" -ForegroundColor Cyan
+    Write-Host "  Shown as Claude Code last saved them for each account. Claude refetches the plan"
+    Write-Host "  and tier when it renews an account's sign-in, and on start once they are over a"
+    Write-Host "  day old. U starts Claude for every account, so it fetches fresh usage and brings"
+    Write-Host "  an old tier up to date too. When a sign-in expires (shown in orange), all of this"
+    Write-Host "  stays frozen until you select the account and sign in again."
+    Write-Host ""
     Write-Host "If something is missing" -ForegroundColor Cyan
     Write-Host "  No projects listed         Press N on the projects screen, or clone a"
     Write-Host ("                             repository into ~/{0}." -f $ProjectsRoot)
-    Write-Host "  No 'Open a new agent'      Agents need a git repository with at least one"
-    Write-Host "                             commit. In that folder run 'git init' and make a"
-    Write-Host "                             first commit (or ask Claude to), or start the"
-    Write-Host "                             project with N instead."
-    Write-Host "  'not signed in'            Select the account to sign in."
-    Write-Host "  VS Code does not open      'code .' has to work inside WSL - it needs the"
-    Write-Host "                             WSL extension in VS Code."
+    Write-Host "  No 'Open a new agent'      Agents need a git repository with a commit: 'git init'"
+    Write-Host "                             and a first commit there, or start the project with N."
+    Write-Host "  'not signed in'/'expired'  Select the account to sign in."
+    Write-Host "  VS Code does not open      'code .' must work in WSL (needs VS Code's WSL extension)."
     Write-Host "  Wrong distribution/folder  Run Setup-Switchboard.bat."
     Wait-AnyKey -Message "Press any key to go back"
 }
@@ -1484,6 +1534,16 @@ function New-AccountMenuItem {
         }
     }
 
+    if ($Profile.Expired) {
+        # Whatever usage and tier are cached stopped updating when the
+        # sign-in died, so showing them would only mislead.
+        $segments += [PSCustomObject]@{ Text = "sign-in expired - select to sign in again"; Color = "Orange" }
+        return [PSCustomObject]@{
+            Text     = $text
+            Segments = $segments
+        }
+    }
+
     if (-not $ShowUsage) {
         return [PSCustomObject]@{
             Text     = $text
@@ -1554,6 +1614,12 @@ function Update-StaleUsage {
 
     foreach ($profileEntry in $Profiles) {
         $configDir = [string]$profileEntry.ConfigDir
+
+        # Not even U helps here: without a working sign-in the refresh can
+        # only fail, after a few seconds of trying, on every redraw.
+        if (-not $profileEntry.SignedIn -or $profileEntry.Expired) {
+            continue
+        }
 
         if (-not $Force) {
             if ($script:UsageRefreshTried.ContainsKey($configDir)) {
@@ -1745,6 +1811,20 @@ function Show-AccountMenu {
                 Write-Host ("Account '{0}' is not signed in yet." -f $selected.Name) -ForegroundColor Yellow
                 if (Read-ConfirmKey -Question "Sign in to it now?" -DefaultYes $true) {
                     [void](Invoke-ClaudeLogin -RunnerPath $RunnerPath -ConfigDir ([string]$selected.ConfigDir))
+                    $script:UsageRefreshTried.Remove([string]$selected.ConfigDir)
+                }
+                continue
+            }
+            if ($selected.Expired) {
+                # Signing in again writes fresh credentials into the same
+                # config dir, so the account keeps its settings and history;
+                # the known email steers the browser to the right account.
+                Write-Host ""
+                Write-ColoredText -Text ("The sign-in for '{0}' has expired." -f $selected.Name) -Color "Orange"
+                Write-Host ""
+                if (Read-ConfirmKey -Question "Sign in to it again now?" -DefaultYes $true) {
+                    [void](Invoke-ClaudeLogin -RunnerPath $RunnerPath -ConfigDir ([string]$selected.ConfigDir) `
+                            -Email ([string]$selected.Email))
                     $script:UsageRefreshTried.Remove([string]$selected.ConfigDir)
                 }
                 continue
