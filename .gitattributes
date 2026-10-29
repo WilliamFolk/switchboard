@@ -1,0 +1,5 @@
+# cmd.exe needs CRLF in batch files; everything else is kept as LF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ico binary
+*.png binary
